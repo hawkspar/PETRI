@@ -8,7 +8,7 @@ from mpi4py.MPI import COMM_WORLD as comm
 parameters["form_compiler"]["quadrature_degree"] = 8"""
 
 Xc = [.5, .5]
-r = .2
+R = .2
 
 # Mesh
 mesh = dfx.mesh.create_unit_square(comm, 100, 100, dfx.mesh.CellType.triangle)
@@ -20,12 +20,6 @@ theta=fem.Constant(mesh,.5)   # theta schema
 k=fem.Constant(mesh,1/dt)
 g=fem.Constant(mesh,(0.,-1.))
 
-X=ufl.SpatialCoordinate(mesh)
-
-def ic(x):
-    values = np.zeros((x.shape[0],4))
-    values[:,3] = np.sqrt((x[0]-Xc[0])**2 + (x[1]-Xc[1])**2)-r
-
 # Define function spaces
 FE_vector =ufl.VectorElement("CG",mesh.ufl_cell(),2)
 FE_scalar =ufl.FiniteElement("CG",mesh.ufl_cell(),1)
@@ -33,11 +27,8 @@ FE_scalar =ufl.FiniteElement("CG",mesh.ufl_cell(),1)
 FS = fem.FunctionSpace(mesh,ufl.MixedElement(FE_vector,FE_scalar,FE_scalar))
 D = fem.FunctionSpace(mesh,FE_scalar)
 
-# Distance function
-dist = fem.Expression(ufl.sqrt((X[0]-Xc[0])**2 + (X[1]-Xc[1])**2)-r,D.element.interpolation_points())
 # Define unknown and test function(s)
-w  = fem.Function(FS)
-w0 = fem.Function(FS)
+w, w0 = fem.Function(FS), fem.Function(FS)
 
 v_,p_,l_=ufl.TestFunctions(FS)
 v, p, l =ufl.split(w)
@@ -49,7 +40,7 @@ FS0c,_=FS0.collapse()
 # Degrees of freedom
 dofs = fem.locate_dofs_geometrical((FS0, FS0c), lambda x: (np.isclose(x[0],0)+np.isclose(x[0],1)+np.isclose(x[1],0))>=1)
 cst = fem.Function(FS0c)
-cst.interpolate(lambda x: np.zeros_like(x[:2,:]))
+cst.interpolate(lambda x: np.zeros_like(x[:2]))
 bcs.append(fem.dirichletbc(cst,dofs,FS0))
 
 rho1,rho2=1e3,1e2
@@ -81,22 +72,13 @@ J = ufl.derivative(F, w)
 #ffc_options = {"quadrature_degree": 4, "optimize": True, "eliminate_zeros": False}
 problem=fem.petsc.NonlinearProblem(F,w,bcs,J)#,ffc_options)
 solver=dfx.nls.petsc.NewtonSolver(comm,problem)
-
-#prm = solver.parameters
-#info(prm, True)
-#prm['newton_solver']['linear_solver'] = 'umfpack'
-#prm['newton_solver']['lu_solver']['report'] = False
-#prm['newton_solver']['lu_solver']['same_nonzero_pattern']=True
 solver.atol, solver.rtol = 1e-10, 1e-10
 solver.max_iter = 20
-#prm['newton_solver']['report'] = True
-#prm['newton_solver']['error_on_nonconvergence'] = False
 
-w.interpolate(ic)
-w0.interpolate(ic)
-
-v,p,l    = w.split()
-v0,p0,l0 = w0.split()
+v,p,l = w.split()
+v.interpolate(lambda x: np.zeros_like(x)[:2])
+p.interpolate(lambda x: np.zeros_like(x)[0])
+l.interpolate(lambda x: (x[0]-Xc[0])**2 + (x[1]-Xc[1])**2 - R**2)
 
 def reinit(l,mesh):
     #implement here:
@@ -105,37 +87,33 @@ def reinit(l,mesh):
     # and the zero levelset does not change (too much)
     return l
 
-#assign(l, interpolate (dist,L))
-#assign(l0, interpolate (dist,L))
-
-#plot(l0,interactive=True)
-#plot(rho(l),interactive=True)
 # Create files for storing solution
 for name,fun in zip(["velocity", "pressure", "levelset"],[v,p,l]):
-    with dfx.io.XDMFFile(comm, "velocity.xdmf", "r") as xdmf:
+    with dfx.io.XDMFFile(comm, name+"_t=0.xdmf", "w") as xdmf:
         xdmf.write_mesh(mesh)
         xdmf.write_function(fun)
 
 # Time-stepping
 t = dt
+c=0
 while t < t_end:
-
-   print("t =", t)
-
-   print("Solving transport...")
-   solver.solve()
-
-   (v,p,l)=w.split(True)
-   for name,fun in zip(["velocity", "pressure", "levelset"],[v,p,l]):
-        with dfx.io.XDMFFile(comm, "velocity.xdmf", "r") as xdmf:
-            xdmf.write_function(fun,t)
-
-   V=fem.assemble(ufl.conditional(ufl.lt(l,0.0),1.0,0.0)*ufl.dx)
+   V=fem.assemble_scalar(fem.form(ufl.conditional(ufl.lt(l,0.),1.,0.)*ufl.dx))
    print("volume=",V)
+   print("t =", t)
+   print("Solving transport...")
+   solver.solve(w)
+
+   v,p,l=w.split()
+   
+   if c%10==0:
+    for name,fun in zip(["velocity", "pressure", "levelset"],[v,p,l]):
+            with dfx.io.XDMFFile(comm, name+f"_t={t:.2f}".replace('.',',')+".xdmf", "w") as xdmf:
+                xdmf.write_mesh(mesh)
+                xdmf.write_function(fun,t)
 
    # Move to next time step
    l1=reinit(l,mesh)
-   #assign(w.sub(2),interpolate(l1,L))
 
    w0.interpolate(w)
-   t += dt  # t:=t+1
+   t += dt
+   c += 1
