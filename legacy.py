@@ -38,7 +38,7 @@ bcs = []
 FS0=FS.sub(0)
 FS0c,_=FS0.collapse()
 # Degrees of freedom
-dofs = fem.locate_dofs_geometrical((FS0, FS0c), lambda x: (np.isclose(x[0],0)+np.isclose(x[0],1)+np.isclose(x[1],0))>=1)
+dofs = fem.locate_dofs_geometrical((FS0, FS0c), lambda x: (np.isclose(x[0],0)+np.isclose(x[0],1)+np.isclose(x[1],0)+np.isclose(x[1],1))>=1)
 cst = fem.Function(FS0c)
 cst.interpolate(lambda x: np.zeros_like(x[:2]))
 bcs.append(fem.dirichletbc(cst,dofs,FS0))
@@ -89,7 +89,7 @@ def reinit(l,mesh):
 
 # Create files for storing solution
 for name,fun in zip(["velocity", "pressure", "levelset"],[v,p,l]):
-    with dfx.io.XDMFFile(comm, name+"_t=0.xdmf", "w") as xdmf:
+    with dfx.io.XDMFFile(comm, "dat/"+name+"_t=0.xdmf", "w") as xdmf:
         xdmf.write_mesh(mesh)
         xdmf.write_function(fun)
 
@@ -107,7 +107,7 @@ while t < t_end:
    
    if c%10==0:
     for name,fun in zip(["velocity", "pressure", "levelset"],[v,p,l]):
-            with dfx.io.XDMFFile(comm, name+f"_t={t:.2f}".replace('.',',')+".xdmf", "w") as xdmf:
+            with dfx.io.XDMFFile(comm, "dat/"+name+f"_t={t:.2f}".replace('.',',')+".xdmf", "w") as xdmf:
                 xdmf.write_mesh(mesh)
                 xdmf.write_function(fun,t)
 
