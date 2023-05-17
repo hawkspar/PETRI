@@ -1,119 +1,177 @@
+from dolfin import *
 import ufl
-import numpy as np
-import dolfinx as dfx
-from dolfinx import fem
-from mpi4py.MPI import COMM_WORLD as comm
+import time
+import os
 
-"""parameters["form_compiler"]["cpp_optimize"] = True
-parameters["form_compiler"]["quadrature_degree"] = 8"""
+#set_log_level(PROGRESS)
+# get file name
+fileName = os.path.splitext(__file__)[0]
+parameters["form_compiler"]["cpp_optimize"] = True
+parameters["form_compiler"]["quadrature_degree"] = 8
+#parameters["form_compiler"]["quadrature_rule"] = 'auto'
 
-Xc = [.5, .5]
-R = .2
+comm = mpi_comm_world()
+rank = MPI.rank(comm)
+set_log_level(INFO if rank==0 else INFO+1)
+ufl.set_level(ufl.INFO if rank==0 else ufl.INFO+1)
+parameters["std_out_all_processes"] = False;
+info_blue(dolfin.__version__)
 
-# Mesh
-mesh = dfx.mesh.create_unit_square(comm, 100, 100, dfx.mesh.CellType.triangle)
+
+center = Point(0.5, 0.5)
+radius = 0.2
+
+#parameters['linear_algebra_backend'] = 'uBLAS'
+
 
 # Time stepping parameters
-dt = .01
-t_end = 10.
-theta=fem.Constant(mesh,.5)   # theta schema
-k=fem.Constant(mesh,1/dt)
-g=fem.Constant(mesh,(0.,-1.))
+dt = 0.01    #casovy krok
+t_end = 10.0  # cas pujde od nuly do t_end
+theta=Constant(0.5)   # theta schema
+k=Constant(1.0/dt)
+g=Constant((0.0,-1.0))
+
+# Mesh
+mesh = RectangleMesh(0.0,0.0,1.0,2.0,20,40,'crossed')
+
+# pocatecni distance function
+dist = Expression("sqrt((x[0]-A)*(x[0]-A) + (x[1]-B)*(x[1]-B))-r", A=center[0], B=center[1],r=radius)
+
+class InitialCondition(Expression):
+    def eval(self, values, x):
+        values[0] = 0.0
+        values[1] = 0.0
+        values[2] = 0.0
+        values[3] = sqrt((x[0]-center[0])*(x[0]-center[0]) + (x[1]-center[1])*(x[1]-center[1]))-radius
+    def value_shape(self):
+        return (4,)
+
+ic=InitialCondition()
 
 # Define function spaces
-FE_vector =ufl.VectorElement("CG",mesh.ufl_cell(),2)
-FE_scalar =ufl.FiniteElement("CG",mesh.ufl_cell(),1)
-# Taylor Hodd elements ; stable element pair + level-set
-FS = fem.FunctionSpace(mesh,ufl.MixedElement(FE_vector,FE_scalar,FE_scalar))
-D = fem.FunctionSpace(mesh,FE_scalar)
+V = VectorFunctionSpace(mesh, "CG", 2)
+P = FunctionSpace(mesh, "CG", 1)
+L = FunctionSpace(mesh, "CG", 1)  # prostor pro transport distancni funkce
+W = MixedFunctionSpace([V, P, L])
 
 # Define unknown and test function(s)
-w, w0 = fem.Function(FS), fem.Function(FS)
+w = Function(W)
+w0 = Function(W)
 
-v_,p_,l_=ufl.TestFunctions(FS)
-v, p, l =ufl.split(w)
-v0,p0,l0=ufl.split(w0)
+(v_, p_, l_) = TestFunctions(W)
 
-bcs = []
-FS0=FS.sub(0)
-FS0c,_=FS0.collapse()
-# Degrees of freedom
-dofs = fem.locate_dofs_geometrical((FS0, FS0c), lambda x: (np.isclose(x[0],0)+np.isclose(x[0],1)+np.isclose(x[1],0)+np.isclose(x[1],1))>=1)
-cst = fem.Function(FS0c)
-cst.interpolate(lambda x: np.zeros_like(x[:2]))
-bcs.append(fem.dirichletbc(cst,dofs,FS0))
+(v,p,l)=split(w)
+(v0,p0,l0)=split(w0)
 
-rho1,rho2=1e3,1e2
-mu1, mu2 =10,1
-eps=1e-6
+bcs = list()
+bcs.append( DirichletBC(W.sub(0), Constant((0.0, 0.0)), "near(x[0],0.0) || near(x[0],1.0) || near(x[1],0.0)") )
 
-def Sign(q):  return ufl.conditional(ufl.lt(abs(q),eps),q/eps,ufl.sign(q))
+rho1=1e3
+rho2=1e2
+mu1=1e1
+mu2=1e0
+eps=1e-4
 
-def Delta(q): return ufl.conditional(ufl.lt(abs(q),eps),.5/eps*(1.+ufl.cos(np.pi*q/eps)),fem.Constant(mesh,0.))
+def Sign(q):
+    return conditional(lt(abs(q),eps),q/eps,sign(q))
 
-def rho(l): return .5*(rho1 * (1+Sign(l)) + rho2 * (1-Sign(l)))
+def Delta(q):
+    return conditional(lt(abs(q),eps),(1.0/eps)*0.5*(1.0+cos(3.14159*q/eps)),Constant(0.0))
 
-def nu(l):  return .5*(mu1  * (1+Sign(l)) + mu2  * (1-Sign(l)))
+def rho(l):
+    return(rho1 * 0.5* (1.0+ Sign(l)) + rho2 * 0.5*(1.0 - Sign(l)))
 
-def EQ(v,p,l,v_,_,l_):
-    F_ls = ufl.inner(ufl.div(l*v),l_) 
-    T = -p*I + nu(l)*(ufl.grad(v)+ufl.grad(v).T)
-    F_ns = ufl.inner(T,ufl.grad(v_)) + rho(l)*ufl.inner(ufl.grad(v)*v, v_) - rho(l)*ufl.inner(g,v_)
-    return (F_ls+F_ns)*ufl.dx
+def nu(l):
+   return(mu1 * 0.5* (1.0+ Sign(l)) + mu2 * 0.5*(1.0 - Sign(l)))
 
-n = ufl.FacetNormal(mesh)
-I = ufl.Identity(2)    # Identity tensor
-h = ufl.avg(ufl.Circumradius(mesh))
-r = .1*h**2*ufl.inner(ufl.jump(ufl.grad(l),n), ufl.jump(ufl.grad(l_),n))*ufl.dS
+def EQ(v,p,l,v_,p_,l_):
+    F_ls = inner(div(l*v),l_)*dx 
+    T= -p*I + nu(l)*(grad(v)+grad(v).T)
+    F_ns = inner(T,grad(v_))*dx + rho(l)*inner(grad(v)*v, v_)*dx - rho(l)*inner(g,v_)*dx
+    F=F_ls+F_ns
+    return(F)
 
-F=k*0.5*(theta*rho(l)+(1.0-theta)*rho(l0))*ufl.inner(v-v0,v_)*ufl.dx + k*ufl.inner(l-l0,l_)*ufl.dx + theta*EQ(v,p,l,v_,p_,l_) + (1.0-theta)*EQ(v0,p,l0,v_,p_,l_) + ufl.div(v)*p_*ufl.dx + r
+n = FacetNormal(mesh)
+I = Identity(V.cell().geometric_dimension())    # Identity tensor
+h = CellSize(mesh)
+h_avg = (h('+') + h('-'))/2.0
+alpha=Constant(0.1)
+r = alpha('+')*h_avg*h_avg*inner(jump(grad(l),n), jump(grad(l_),n))*dS
 
-J = ufl.derivative(F, w)
-#ffc_options = {"quadrature_degree": 4, "optimize": True, "eliminate_zeros": False}
-problem=fem.petsc.NonlinearProblem(F,w,bcs,J)#,ffc_options)
-solver=dfx.nls.petsc.NewtonSolver(comm,problem)
-solver.atol, solver.rtol = 1e-10, 1e-10
-solver.max_iter = 20
+F=k*0.5*(theta*rho(l)+(1.0-theta)*rho(l0))*inner(v-v0,v_)*dx + k*inner(l-l0,l_)*dx + theta*EQ(v,p,l,v_,p_,l_) + (1.0-theta)*EQ(v0,p,l0,v_,p_,l_) + div(v)*p_*dx + r
 
-v,p,l = w.split()
-v.interpolate(lambda x: np.zeros_like(x)[:2])
-p.interpolate(lambda x: np.zeros_like(x)[0])
-l.interpolate(lambda x: (x[0]-Xc[0])**2 + (x[1]-Xc[1])**2 - R**2)
+J = derivative(F, w)
+ffc_options = {"quadrature_degree": 4, "optimize": True, "eliminate_zeros": False}
+problem=NonlinearVariationalProblem(F,w,bcs,J,ffc_options)
+solver=NonlinearVariationalSolver(problem)
+
+prm = solver.parameters
+#info(prm, True)
+prm['nonlinear_solver'] = 'newton'
+prm['newton_solver']['linear_solver'] = 'umfpack'
+prm['newton_solver']['lu_solver']['report'] = False
+prm['newton_solver']['lu_solver']['same_nonzero_pattern']=True
+prm['newton_solver']['absolute_tolerance'] = 1E-10
+prm['newton_solver']['relative_tolerance'] = 1E-10
+prm['newton_solver']['maximum_iterations'] = 20
+prm['newton_solver']['report'] = True
+#prm['newton_solver']['error_on_nonconvergence'] = False
+
+
+w.assign(interpolate(ic,W))
+w0.assign(interpolate(ic,W))
+
+(v,p,l) = w.split()
+(v0,p0,l0) = w0.split()
+
 
 def reinit(l,mesh):
     #implement here:
     #   given mesh and function l on the mesh
     # reinitialize function l such that |grad(l)|=1
     # and the zero levelset does not change (too much)
+
+    
+
     return l
 
+
+#assign(l, interpolate (dist,L))
+#assign(l0, interpolate (dist,L))
+
+#plot(l0,interactive=True)
+#plot(rho(l),interactive=True)
 # Create files for storing solution
-for name,fun in zip(["velocity", "pressure", "levelset"],[v,p,l]):
-    with dfx.io.XDMFFile(comm, "dat/"+name+"_t=0.xdmf", "w") as xdmf:
-        xdmf.write_mesh(mesh)
-        xdmf.write_function(fun)
+vfile = File("%s.results/velocity.pvd" % (fileName))
+pfile = File("%s.results/pressure.pvd" % (fileName))
+lfile = File("%s.results/levelset.pvd" % (fileName))
+
+v.rename("v", "velocity") ; vfile << v
+p.rename("p", "pressure") ; pfile << p
+l.rename("l", "levelset") ; lfile << l
 
 # Time-stepping
 t = dt
-c=0
 while t < t_end:
-   V=fem.assemble_scalar(fem.form(ufl.conditional(ufl.lt(l,0.),1.,0.)*ufl.dx))
-   print("volume=",V)
-   print("t =", t)
-   print("Solving transport...")
-   solver.solve(w)
 
-   v,p,l=w.split()
-   
-   if c%10==0:
-    for name,fun in zip(["velocity", "pressure", "levelset"],[v,p,l]):
-            with dfx.io.XDMFFile(comm, "dat/"+name+f"_t={t:.2f}".replace('.',',')+".xdmf", "w") as xdmf:
-                xdmf.write_mesh(mesh)
-                xdmf.write_function(fun,t)
+   print "t =", t
 
+   begin("Solving transport...")
+   solver.solve()
+   end()
+
+   (v,p,l)=w.split(True)
+   v.rename("v", "velocity") ; vfile << v
+   p.rename("p", "pressure") ; pfile << p
+   l.rename("l", "levelset") ; lfile << l
+
+   V=assemble(conditional(lt(l,0.0),1.0,0.0)*dx)
+   print "volume= %e"%V
+
+   plot(v,interactive=True)
    # Move to next time step
    l1=reinit(l,mesh)
+   #assign(w.sub(2),interpolate(l1,L))
 
-   w0.interpolate(w)
-   t += dt
-   c += 1
+   w0.assign(w)
+   t += dt  # t:=t+1

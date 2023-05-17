@@ -1,163 +1,120 @@
-# coding: utf-8
-"""
-Created on Fri Dec 10 12:00:00 2021
-
-@author: hawkspar
-"""
-import os, ufl, re
+import ufl
 import numpy as np
 import dolfinx as dfx
 from dolfinx import fem
-from petsc4py import PETSc as pet
 from mpi4py.MPI import COMM_WORLD as comm
 
-p0=comm.rank==0
+"""parameters["form_compiler"]["cpp_optimize"] = True
+parameters["form_compiler"]["quadrature_degree"] = 8"""
 
-# Numerical Parameters
-params = {"rp":.95,    #relaxation_parameter
-		  "atol":1e-12, #absolute_tolerance
-		  "rtol":1e-9, #DOLFIN_EPS does not work well
-		  "max_iter":100}
-Re=100
-dt=1e-4
+Xc = [.5, .5]
+R = .2
 
-mesh = dfx.mesh.create_unit_square(comm, 100, 100, dfx.mesh.CellType.quadrilateral)
+# Mesh
+mesh = dfx.mesh.create_unit_square(comm, 100, 100, dfx.mesh.CellType.triangle)
 
-r = ufl.SpatialCoordinate(mesh)[1]
-# Finite elements & function spaces
-FE_vector =ufl.VectorElement("CG",mesh.ufl_cell(),2,3)
+# Time stepping parameters
+dt = .01
+t_end = 10.
+theta=fem.Constant(mesh,.5) # theta schema
+g=fem.Constant(mesh,(0.,-1.)) # Gravity !
+
+# Define function spaces
+FE_vector =ufl.VectorElement("CG",mesh.ufl_cell(),2)
 FE_scalar =ufl.FiniteElement("CG",mesh.ufl_cell(),1)
-FE_scalar2=ufl.FiniteElement("DG",mesh.ufl_cell(),0)
-FS0 = fem.FunctionSpace(mesh,FE_vector)
-FS1 = fem.FunctionSpace(mesh,FE_scalar)
-FS2 = fem.FunctionSpace(mesh,FE_scalar2)
-# Taylor Hodd elements ; stable element pair + eddy viscosity
-FS = fem.FunctionSpace(mesh,FE_vector*FE_scalar*FE_scalar2)
-# Trial & test functions
-Q  = fem.Function(FS)
-Qn = ufl.TrialFunction(FS)
-T  = ufl.TestFunction( FS)
-# Trivial BC
-mesh.topology.create_connectivity(1, 2)
-boundary_facets = mesh.exterior_facet_indices(mesh.topology)
-boundary_dofs = fem.locate_dofs_topological(FS, 1, boundary_facets)
-bc = fem.dirichletbc(fem.Constant(mesh,0), boundary_dofs)
+# Taylor Hodd elements ; stable element pair + level-set
+FS = fem.FunctionSpace(mesh,ufl.MixedElement(FE_vector,FE_scalar,FE_scalar))
+D = fem.FunctionSpace(mesh,FE_scalar)
 
-# Cylindrical operators
-def grd(v):
-	if len(v.ufl_shape)==0: return ufl.as_vector([v.dx(0), v.dx(1), 0])
-	return ufl.as_tensor([[v[0].dx(0), v[0].dx(1),  0],
-						  [v[1].dx(0), v[1].dx(1), -v[2]/r],
-						  [v[2].dx(0), v[2].dx(1),  v[1]/r]])
+# Define unknown and test function(s)
+w, w0 = fem.Function(FS), fem.Function(FS)
 
-def div(v):
-	if len(v.ufl_shape)==1: return v[0].dx(0) + (r*v[1]).dx(1)/r
-	return ufl.as_vector([v[0,0].dx(0)+(r*v[1,0]).dx(1),
-						  v[0,1].dx(0)+(r*v[1,1]).dx(1)-v[2,2]/r,
-						  v[0,2].dx(0)+(r*v[1,2]).dx(1)+v[2,1]/r])
+v_,p_,l_=ufl.TestFunctions(FS)
+v, p, l =ufl.split(w)
+v0,p0,l0=ufl.split(w0)
 
-def dirCreator(path:str):
-	if not os.path.isdir(path):
-		if p0: os.mkdir(path)
-	comm.barrier() # Wait for all other processors
+dx = ufl.dx(degree=4)
 
-def checkComm(f:str):
-	match = re.search(r'n=(\d*)',f)
-	if int(match.group(1))!=comm.size: return False
-	match = re.search(r'p=([0-9]*)',f)
-	if int(match.group(1))!=comm.rank: return False
-	return True
-	
-# Krylov subspace
-def configureKSP(KSP:pet.KSP,params:dict,icntl:bool=False) -> None:
-	KSP.setTolerances(rtol=params['rtol'], atol=params['atol'], max_it=params['max_iter'])
-	# Krylov subspace
-	KSP.setType('preonly')
-	# Preconditioner
-	PC = KSP.getPC(); PC.setType('lu')
-	PC.setFactorSolverType('mumps')
-	KSP.setFromOptions()
-	if icntl: PC.getFactorMatrix().setMumpsIcntl(14,500)
+bcs = []
+FS0=FS.sub(0)
+FS0c,_=FS0.collapse()
+# Degrees of freedom
+dofs = fem.locate_dofs_geometrical((FS0, FS0c), lambda x: (np.isclose(x[0],0)+np.isclose(x[0],1)+np.isclose(x[1],0)+np.isclose(x[1],1))>=1)
+cst = fem.Function(FS0c)
+cst.interpolate(lambda x: np.zeros_like(x[:2]))
+bcs.append(fem.dirichletbc(cst,dofs,FS0))
 
-# Naive save with dir creation
-def saveStuff(dir:str,name:str,fun:fem.Function) -> None:
-	dirCreator(dir)
-	proc_name=dir+name.replace('.',',')+f"_n={comm.size:d}_p={comm.rank:d}"
-	fun.x.scatter_forward()
-	np.save(proc_name,fun.x.array)
-	if p0: print("Saved "+proc_name+".npy",flush=True)
+rho1,rho2=1e3,1e2
+mu1, mu2 =10,1
+eps=1e-6
 
-# Memoisation routine - find closest in param
-def findStuff(path:str,params:dict,format=lambda f:True,distributed=True):
-	closest_file_name=path
-	file_names = [f for f in os.listdir(path) if format(f)]
-	d=np.infty
-	for file_name in file_names:
-		if not distributed or checkComm(file_name): # Lazy evaluation !
-			fd=0 # Compute distance according to all params
-			for param in params:
-				match = re.search(param+r'=(\d*(,|e|-|j|\+)?\d*)',file_name)
-				param_file = float(match.group(1).replace(',','.')) # Take advantage of file format
-				fd += abs(params[param]-param_file)
-			if fd<d: d,closest_file_name=fd,path+file_name
-	return closest_file_name
+def Sign(q):  return ufl.conditional(ufl.lt(abs(q),eps),q/eps,ufl.sign(q))
 
-def loadStuff(path:str,params:dict,fun:fem.Function) -> None:
-	closest_file_name=findStuff(path,params,lambda f: f[-3:]=="npy")
-	fun.x.array[:]=np.load(closest_file_name,allow_pickle=True)
-	fun.x.scatter_forward()
-	# Loading eddy viscosity too
-	if p0: print("Loaded "+closest_file_name,flush=True)
+def Delta(q): return ufl.conditional(ufl.lt(abs(q),eps),.5/eps*(1.+ufl.cos(np.pi*q/eps)),fem.Constant(mesh,0.))
 
-# Shorthands
-U,  P,  F  = ufl.split(Q)
-Un, Pn, Fn = ufl.split(Qn)
-v,  s,  f  = ufl.split(T)
+def rho(l): return .5*(rho1 * (1+Sign(l)) + rho2 * (1-Sign(l)))
 
-R=1/Re*div(grd(U))-grd(U)*U
+def nu(l):  return .5*(mu1  * (1+Sign(l)) + mu2  * (1-Sign(l)))
 
-F =ufl.inner(div(grd(Pn))-div(U+dt*R)/dt,s)*ufl.conditional(ufl.le(F,1),0,1)
-F+=ufl.inner(Un-U-dt*R+dt*grd(Pn),v)
+def EQ(v,p,l,v_,_,l_):
+    F_ls = ufl.inner(ufl.div(l*v),l_) 
+    T = -p*I + nu(l)*(ufl.grad(v)+ufl.grad(v).T)
+    F_ns = ufl.inner(T,ufl.grad(v_)) + rho(l)*ufl.inner(ufl.grad(v)*v, v_) - rho(l)*ufl.inner(g,v_)
+    return F_ls+F_ns
 
-def marchP() -> ufl.Form:
-	# Functions
-	U,  P,  F  = ufl.split(Q)
-	Un, Pn, Fn = ufl.split(Qn)
-	nu = 1/Re
-	_, s, _ = ufl.split(T)
-	F  = ufl.inner(div(grd(Pn)),  s)
-	F  = ufl.inner(div(grd(Pn)),  s)
-	# Momentum (different test functions and IBP)
-	F += ufl.inner(Un-U,	 v)/dt # Time march
-	F += ufl.inner(grd(U)*U, v) # Convection
-	F -= ufl.inner(	  Pn,div(v)) # Pressure
-	F += ufl.inner(grd(U)+grd(U).T,
-						 grd(v))*nu # Diffusion (grad u.T significant with nut)
-	F += ufl.inner(Fn-F,	 f)/dt # Time march
-	F += ufl.inner(div(F*U), f) # Convection
-	return F*r*ufl.dx
+n = ufl.FacetNormal(mesh)
+I = ufl.Identity(2)    # Identity tensor
+h = ufl.avg(ufl.Circumradius(mesh))
 
-# Heart of this entire code
-def navierStokes() -> ufl.Form:
-	# Functions
-	U,  P,  F  = ufl.split(Q)
-	Un, Pn, Fn = ufl.split(Qn)
-	nu = 1/Re
-	v, s, f = ufl.split(T)
-	# Mass (variational formulation)
-	F  = ufl.inner(div(Un),  s)
-	# Momentum (different test functions and IBP)
-	F += ufl.inner(Un-U,	 v)/dt # Time march
-	F += ufl.inner(grd(U)*U, v) # Convection
-	F -= ufl.inner(	  Pn,div(v)) # Pressure
-	F += ufl.inner(grd(U)+grd(U).T,
-						 grd(v))*nu # Diffusion (grad u.T significant with nut)
-	F += ufl.inner(Fn-F,	 f)/dt # Time march
-	F += ufl.inner(grd(U)*F, f) # Convection
-	return F*r*ufl.dx
+# Time stepping
+F=.5*(theta*rho(l)+(1.-theta)*rho(l0))*ufl.inner(v-v0,v_) + ufl.inner(l-l0,l_) # March in time impetus and LS
+F+=theta*EQ(v,p,l,v_,p_,l_) + (1.-theta)*EQ(v0,p0,l0,v_,p_,l_) + ufl.div(v)*p_ # Enforce physics (including compressibility)
+F*=dx/dt # Volume integral, time 
+F+=.1*h**2*ufl.inner(ufl.jump(ufl.grad(l),n), ufl.jump(ufl.grad(l_),n))*ufl.dS # Surface tension
 
-def printStuff(name:str,fun:fem.Function) -> None:
-	with dfx.io.XDMFFile(comm, name.replace('.',',')+".xdmf", "w") as xdmf:
-		xdmf.write_mesh(mesh)
-		xdmf.write_function(fun)
-	if p0: print("Printed "+name.replace('.',',')+".xdmf",flush=True)
+gd_l=ufl.grad(l)
+n=ufl.sqrt(ufl.inner(gd_l,gd_l))
+def S(l,eps): return l/ufl.sqrt(l**2+eps**2)
+G=(ufl.inner(v,v_)+ufl.inner(p,p_)+ufl.inner(f*(l-l0)-S(l0,eps)*(1-n),l_))*dx
+
+problem=fem.petsc.NonlinearProblem(F,w,bcs,jit_options={"cffi_extra_compile_args": ["-Ofast", "-march=native"], "cffi_libraries": ["m"]})
+reinit =fem.petsc.NonlinearProblem(G,w,bcs,jit_options={"cffi_extra_compile_args": ["-Ofast", "-march=native"], "cffi_libraries": ["m"]})
+solver_pb=dfx.nls.petsc.NewtonSolver(comm,problem)
+solver_reinit=dfx.nls.petsc.NewtonSolver(comm,problem)
+for solver in (solver_pb,solver_reinit):
+    solver.atol, solver.rtol = 1e-10, 1e-10
+    solver.max_iter = 20
+
+v,p,l = w.split()
+v.interpolate(lambda x: np.zeros_like(x)[:2])
+p.interpolate(lambda x: np.zeros_like(x)[0])
+l.interpolate(lambda x: (x[0]-Xc[0])**2 + (x[1]-Xc[1])**2 - R**2)
+
+# Create files for storing solution
+for name,fun in zip(["velocity", "pressure", "levelset"],[v,p,l]):
+    with dfx.io.XDMFFile(comm, "dat/"+name+"_t=0.xdmf", "w") as xdmf:
+        xdmf.write_mesh(mesh)
+        xdmf.write_function(fun)
+
+# Time-stepping
+t = dt
+c=0
+while t < t_end:
+    V=fem.assemble_scalar(fem.form(ufl.conditional(ufl.lt(l,0.),1.,0.)*dx))
+    print("volume=",V)
+    print("t =", t)
+    print("Solving transport...")
+    solver_pb.solve(w)
+    v,p,l=w.split()
+    if c%10==0:
+        for name,fun in zip(["velocity", "pressure", "levelset"],[v,p,l]):
+            with dfx.io.XDMFFile(comm, "dat/"+name+f"_t={t:.2f}".replace('.',',')+".xdmf", "w") as xdmf:
+                xdmf.write_mesh(mesh)
+                xdmf.write_function(fun,t)
+    w0.interpolate(w)
+    # Reinitialise l
+    """solver_reinit.solve(l)
+    l0.interpolate(l)"""
+    # Move to next time step
+    t += dt
+    c += 1
